@@ -12,55 +12,30 @@ PAIRS = {"USDCHF=X": "USD/CHF", "CHFJPY=X": "CHF/JPY"}
 
 # ─── TELEGRAM HELPERS ─────────────────────────────────
 def send(chat_id, msg, reply_markup=None):
-    payload = {
-        "chat_id": chat_id,
-        "text": msg,
-        "parse_mode": "HTML"
-    }
+    payload = {"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json=payload,
-        timeout=10
-    )
+    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=payload, timeout=10)
 
 def edit(chat_id, message_id, msg, reply_markup=None):
-    payload = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": msg,
-        "parse_mode": "HTML"
-    }
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": msg, "parse_mode": "HTML"}
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText",
-        json=payload,
-        timeout=10
-    )
+    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText", json=payload, timeout=10)
 
 def answer_callback(callback_id):
-    requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery",
-        json={"callback_query_id": callback_id},
-        timeout=10
-    )
+    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": callback_id}, timeout=10)
 
 def get_signal_button():
-    return {
-        "inline_keyboard": [[
-            {"text": "Get Signal 📊", "callback_data": "get_signal"}
-        ]]
-    }
+    return {"inline_keyboard": [[{"text": "Get Signal 📊", "callback_data": "get_signal"}]]}
 
 # ─── INDICATORS ───────────────────────────────────────
 def heiken_ashi(df):
     ha = pd.DataFrame(index=df.index)
     ha['Close'] = (df['Open'] + df['High'] + df['Low'] + df['Close']) / 4
-    ha_open = [(df['Open'].iloc[0] + df['Close'].iloc[0]) / 2]
+    ha_open = [(float(df['Open'].iloc[0]) + float(df['Close'].iloc[0])) / 2]
     for i in range(1, len(df)):
-        ha_open.append((ha_open[i-1] + ha['Close'].iloc[i-1]) / 2)
+        ha_open.append((ha_open[i-1] + float(ha['Close'].iloc[i-1])) / 2)
     ha['Open'] = ha_open
     ha['High'] = pd.concat([df['High'], ha['Open'], ha['Close']], axis=1).max(axis=1)
     ha['Low'] = pd.concat([df['Low'], ha['Open'], ha['Close']], axis=1).min(axis=1)
@@ -84,8 +59,14 @@ def analyze():
     for ticker, name in PAIRS.items():
         try:
             df = yf.download(ticker, period="2d", interval="1m", progress=False)
+
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+
+            df = df.dropna()
+
             if df.empty or len(df) < 210:
-                results.append(f"⚠️ <b>{name}</b> — Not enough data")
+                results.append(f"⚠️ <b>{name}</b> — Not enough data ({len(df)} candles)")
                 continue
 
             ha     = heiken_ashi(df)
@@ -93,18 +74,25 @@ def analyze():
             mom    = momentum(df['Close'], 10)
             wr     = williams_r(df, 45)
 
-            i = -1
+            # Extract scalar values explicitly
+            ha_close_now  = float(ha['Close'].iloc[-1])
+            ha_open_now   = float(ha['Open'].iloc[-1])
+            ema200_now    = float(ema200.iloc[-1])
+            mom_now       = float(mom.iloc[-1])
+            mom_prev      = float(mom.iloc[-2])
+            wr_now        = float(wr.iloc[-1])
+            wr_prev       = float(wr.iloc[-2])
 
-            ha_above = float(ha['Close'].iloc[i]) > float(ema200.iloc[i])
-            ha_below = float(ha['Close'].iloc[i]) < float(ema200.iloc[i])
-            ha_bull  = float(ha['Close'].iloc[i]) > float(ha['Open'].iloc[i])
-            ha_bear  = float(ha['Close'].iloc[i]) < float(ha['Open'].iloc[i])
+            ha_above = ha_close_now > ema200_now
+            ha_below = ha_close_now < ema200_now
+            ha_bull  = ha_close_now > ha_open_now
+            ha_bear  = ha_close_now < ha_open_now
 
-            mom_bull = float(mom.iloc[i]) > 0 and float(mom.iloc[i]) > float(mom.iloc[i-1])
-            mom_bear = float(mom.iloc[i]) < 0 and float(mom.iloc[i]) < float(mom.iloc[i-1])
+            mom_bull = mom_now > 0 and mom_now > mom_prev
+            mom_bear = mom_now < 0 and mom_now < mom_prev
 
-            wr_up   = float(wr.iloc[i-1]) <= -20 and float(wr.iloc[i]) > -20
-            wr_down = float(wr.iloc[i-1]) >= -80 and float(wr.iloc[i]) < -80
+            wr_up   = wr_prev <= -20 and wr_now > -20
+            wr_down = wr_prev >= -80 and wr_now < -80
 
             now = datetime.now().strftime("%H:%M:%S")
 
@@ -164,7 +152,6 @@ def webhook():
         return jsonify({"ok": True})
 
     try:
-        # Handle inline button tap
         if "callback_query" in data:
             cb      = data["callback_query"]
             chat_id = str(cb["message"]["chat"]["id"])
@@ -175,14 +162,10 @@ def webhook():
             answer_callback(cb_id)
 
             if action == "get_signal":
-                edit(chat_id, msg_id,
-                    "🔍 <b>Analyzing market...</b>\nPlease wait ⏳",
-                    None
-                )
+                edit(chat_id, msg_id, "🔍 <b>Analyzing market...</b>\nPlease wait ⏳", None)
                 result = analyze()
                 send(chat_id, result, reply_markup=get_signal_button())
 
-        # Handle text messages
         elif "message" in data:
             msg     = data["message"]
             chat_id = str(msg["chat"]["id"])
@@ -212,3 +195,4 @@ def home():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+    
