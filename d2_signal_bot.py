@@ -1,14 +1,15 @@
 import os
-import yfinance as yf
-import pandas as pd
+import base64
 import requests
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from datetime import datetime
 
 app = Flask(__name__)
+CORS(app)
 
 BOT_TOKEN = "8722830088:AAFJ3TTivYvBxr7UNWDUyfwxLBNdA4KDhtA"
-PAIRS = {"USDCHF=X": "USD/CHF", "CHFJPY=X": "CHF/JPY"}
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # ─── TELEGRAM HELPERS ─────────────────────────────────
 def send(chat_id, msg, reply_markup=None):
@@ -24,127 +25,90 @@ def edit(chat_id, message_id, msg, reply_markup=None):
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText", json=payload, timeout=10)
 
 def answer_callback(callback_id):
-    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": callback_id}, timeout=10)
+    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery",
+                  json={"callback_query_id": callback_id}, timeout=10)
 
 def get_signal_button():
     return {"inline_keyboard": [[{"text": "Get Signal 📊", "callback_data": "get_signal"}]]}
 
-# ─── INDICATORS ───────────────────────────────────────
-def heiken_ashi(df):
-    ha = pd.DataFrame(index=df.index)
-    ha['Close'] = (df['Open'] + df['High'] + df['Low'] + df['Close']) / 4
-    ha_open = [(float(df['Open'].iloc[0]) + float(df['Close'].iloc[0])) / 2]
-    for i in range(1, len(df)):
-        ha_open.append((ha_open[i-1] + float(ha['Close'].iloc[i-1])) / 2)
-    ha['Open'] = ha_open
-    ha['High'] = pd.concat([df['High'], ha['Open'], ha['Close']], axis=1).max(axis=1)
-    ha['Low'] = pd.concat([df['Low'], ha['Open'], ha['Close']], axis=1).min(axis=1)
-    return ha
-
-def ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
-
-def momentum(series, period):
-    return series - series.shift(period)
-
-def williams_r(df, period):
-    hh = df['High'].rolling(period).max()
-    ll = df['Low'].rolling(period).min()
-    return -100 * (hh - df['Close']) / (hh - ll)
-
-# ─── ANALYZE ──────────────────────────────────────────
+# ─── IMAGE ANALYSIS ENDPOINT ──────────────────────────
+@app.route("/analyze", methods=["POST", "OPTIONS"])
 def analyze():
-    results = []
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True})
 
-    for ticker, name in PAIRS.items():
-        try:
-            df = yf.download(ticker, period="2d", interval="1m", progress=False)
+    try:
+        data = request.json
+        image_base64 = data.get("image")
+        media_type = data.get("media_type", "image/jpeg")
 
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
+        if not image_base64:
+            return jsonify({"error": "No image provided"}), 400
 
-            df = df.dropna()
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": ANTHROPIC_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model": "claude-opus-4-5-20251101",
+                "max_tokens": 500,
+                "system": """You are Dessy FX Bot — an expert binary options chart analyst.
 
-            if df.empty or len(df) < 210:
-                results.append(f"⚠️ <b>{name}</b> — Not enough data ({len(df)} candles)")
-                continue
+The trader uses Pocket Option with Heiken Ashi candles on 5-minute timeframe, 5-minute expiry.
+They enter at the OPEN of the NEXT candle after your signal.
 
-            ha     = heiken_ashi(df)
-            ema200 = ema(df['Close'], 200)
-            mom    = momentum(df['Close'], 10)
-            wr     = williams_r(df, 45)
+Analyze the chart screenshot and give BUY or SELL. Always give one — never refuse or say no signal.
 
-            # Extract scalar values explicitly
-            ha_close_now  = float(ha['Close'].iloc[-1])
-            ha_open_now   = float(ha['Open'].iloc[-1])
-            ema200_now    = float(ema200.iloc[-1])
-            mom_now       = float(mom.iloc[-1])
-            mom_prev      = float(mom.iloc[-2])
-            wr_now        = float(wr.iloc[-1])
-            wr_prev       = float(wr.iloc[-2])
+Look at:
+- Overall trend direction
+- Last 3-5 candle colors and momentum
+- Any clear support/resistance levels
+- Heiken Ashi body size and color sequence
+- Whether price is in a trend or reversal
 
-            ha_above = ha_close_now > ema200_now
-            ha_below = ha_close_now < ema200_now
-            ha_bull  = ha_close_now > ha_open_now
-            ha_bear  = ha_close_now < ha_open_now
+Be decisive like a professional trader. Be honest about confidence.
 
-            mom_bull = mom_now > 0 and mom_now > mom_prev
-            mom_bear = mom_now < 0 and mom_now < mom_prev
+Respond ONLY with valid JSON, no markdown, no extra text:
+{"signal":"BUY","confidence":78,"reason":"2-3 sentence analysis of what you see and why you're calling this direction"}""",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": image_base64
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": "Analyze this Heiken Ashi chart. Give BUY or SELL for the next 5-minute candle."
+                        }
+                    ]
+                }]
+            },
+            timeout=30
+        )
 
-            wr_up   = wr_prev <= -20 and wr_now > -20
-            wr_down = wr_prev >= -80 and wr_now < -80
+        result = response.json()
 
-            now = datetime.now().strftime("%H:%M:%S")
+        if "error" in result:
+            return jsonify({"error": result["error"].get("message", "API error")}), 500
 
-            if ha_above and ha_bull and mom_bull and wr_up:
-                results.append(
-                    f"🟢 <b>BUY — {name}</b>\n"
-                    f"⏱ Expiry: 30s  |  🕐 {now}\n"
-                    f"━━━━━━━━━━━━━━━━\n"
-                    f"✅ HA candle above 200 EMA\n"
-                    f"✅ Momentum 10 bullish\n"
-                    f"✅ Williams %R crossed -20\n"
-                    f"━━━━━━━━━━━━━━━━\n"
-                    f"⚡ <b>HIGH CONFIDENCE — ENTER NOW</b>"
-                )
-            elif ha_below and ha_bear and mom_bear and wr_down:
-                results.append(
-                    f"🔴 <b>SELL — {name}</b>\n"
-                    f"⏱ Expiry: 30s  |  🕐 {now}\n"
-                    f"━━━━━━━━━━━━━━━━\n"
-                    f"✅ HA candle below 200 EMA\n"
-                    f"✅ Momentum 10 bearish\n"
-                    f"✅ Williams %R crossed -80\n"
-                    f"━━━━━━━━━━━━━━━━\n"
-                    f"⚡ <b>HIGH CONFIDENCE — ENTER NOW</b>"
-                )
-            else:
-                bull_count = [ha_above and ha_bull, mom_bull, wr_up].count(True)
-                bear_count = [ha_below and ha_bear, mom_bear, wr_down].count(True)
-                closest = "bull" if bull_count >= bear_count else "bear"
-                count = max(bull_count, bear_count)
+        text = result["content"][0]["text"].replace("```json", "").replace("```", "").strip()
+        import json
+        signal_data = json.loads(text)
+        return jsonify(signal_data)
 
-                c1 = "✅" if (ha_above and ha_bull if closest == "bull" else ha_below and ha_bear) else "❌"
-                c2 = "✅" if (mom_bull if closest == "bull" else mom_bear) else "❌"
-                c3 = "✅" if (wr_up if closest == "bull" else wr_down) else "❌"
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-                results.append(
-                    f"⏸ <b>NO SIGNAL — {name}</b>\n"
-                    f"🕐 {now}  |  {count}/3 confirmations\n"
-                    f"━━━━━━━━━━━━━━━━\n"
-                    f"{c1} HA vs 200 EMA\n"
-                    f"{c2} Momentum 10\n"
-                    f"{c3} Williams %R\n"
-                    f"━━━━━━━━━━━━━━━━\n"
-                    f"⚠️ <b>Not ready. Wait for full confirmation.</b>"
-                )
 
-        except Exception as e:
-            results.append(f"⚠️ <b>{name}</b> — Error: {str(e)}")
-
-    return "\n\n".join(results)
-
-# ─── WEBHOOK ──────────────────────────────────────────
+# ─── TELEGRAM WEBHOOK ─────────────────────────────────
 @app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
 def webhook():
     data = request.json
@@ -153,46 +117,53 @@ def webhook():
 
     try:
         if "callback_query" in data:
-            cb      = data["callback_query"]
+            cb = data["callback_query"]
             chat_id = str(cb["message"]["chat"]["id"])
-            msg_id  = cb["message"]["message_id"]
-            action  = cb["data"]
-            cb_id   = cb["id"]
+            msg_id = cb["message"]["message_id"]
+            action = cb["data"]
+            cb_id = cb["id"]
 
             answer_callback(cb_id)
 
             if action == "get_signal":
                 edit(chat_id, msg_id, "🔍 <b>Analyzing market...</b>\nPlease wait ⏳", None)
-                result = analyze()
-                send(chat_id, result, reply_markup=get_signal_button())
+                send(chat_id,
+                     "📸 <b>Screenshot bot is now active!</b>\n"
+                     "━━━━━━━━━━━━━━━━\n"
+                     "Open the web bot, upload your Heiken Ashi chart screenshot and get your signal.\n"
+                     "━━━━━━━━━━━━━━━━\n"
+                     "Settings: Heiken Ashi • 5 Min TF • 5 Min Expiry",
+                     reply_markup=get_signal_button())
 
         elif "message" in data:
-            msg     = data["message"]
+            msg = data["message"]
             chat_id = str(msg["chat"]["id"])
-            text    = msg.get("text", "").strip().lower()
+            text = msg.get("text", "").strip().lower()
 
             if text == "/start":
                 send(chat_id,
-                    "👋 <b>Welcome to Dessy FX Bot</b>\n"
-                    "━━━━━━━━━━━━━━━━\n"
-                    "📊 Pairs: USD/CHF | CHF/JPY\n"
-                    "📐 Strategy: D2 Modified\n"
-                    "⏱ Expiry: 30 seconds\n"
-                    "━━━━━━━━━━━━━━━━\n"
-                    "Tap the button below to scan the market 👇",
-                    reply_markup=get_signal_button()
-                )
+                     "👋 <b>Welcome to Dessy FX Bot</b>\n"
+                     "━━━━━━━━━━━━━━━━\n"
+                     "📊 Strategy: Screenshot Analysis\n"
+                     "📐 Chart: Heiken Ashi\n"
+                     "⏱ Timeframe: 5 Minutes\n"
+                     "🎯 Expiry: 5 Minutes\n"
+                     "━━━━━━━━━━━━━━━━\n"
+                     "Tap below to get started 👇",
+                     reply_markup=get_signal_button())
 
     except Exception as e:
         print(f"Webhook error: {e}")
 
     return jsonify({"ok": True})
 
+
 @app.route("/")
 def home():
     return "Dessy FX Bot is running."
 
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-    
+        
